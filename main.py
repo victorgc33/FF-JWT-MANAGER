@@ -3,6 +3,8 @@ from datetime import datetime
 import httpx
 import warnings
 import requests
+import json
+import base64
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 import MajorLogin_pb2
@@ -16,7 +18,7 @@ app = Flask(__name__)
 
 # ============ CONFIGURACOES ============
 TOKEN_FILE = "token.txt"
-PORT = 5001
+PORT = 5000
 CLIENT_VERSION = "OB54"
 FREEFIRE_API = "https://client.us.freefiremobile.com"
 
@@ -26,6 +28,7 @@ AES_IV = b'6oyZDr22E3ychjM%'
 
 # ============ VARIAVEIS GLOBAIS ============
 CACHED_JWT = None
+CACHED_ACCOUNT_ID = None
 CURRENT_TOKEN = None
 
 # ============ FUNCOES ============
@@ -35,6 +38,23 @@ def log(msg):
 def encrypt_packet(data_bytes):
     cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
     return cipher.encrypt(pad(data_bytes, AES.block_size))
+
+def decode_jwt(jwt):
+    """Decodifica JWT sem verificar assinatura e extrai account_id"""
+    try:
+        parts = jwt.split('.')
+        if len(parts) != 3:
+            return None
+        
+        payload = parts[1]
+        padding = '=' * (4 - len(payload) % 4)
+        payload += padding
+        decoded = base64.urlsafe_b64decode(payload)
+        data = json.loads(decoded)
+        return data
+    except Exception as e:
+        log(f"❌ Erro ao decodificar JWT: {e}")
+        return None
 
 def get_token_info(access_token):
     """Pega open_id e platform do token"""
@@ -130,8 +150,8 @@ def parse_major_login_response(data):
         return None
 
 def get_cached_jwt_from_token(token):
-    """Faz MajorLogin com um token e retorna o JWT"""
-    global CACHED_JWT, CURRENT_TOKEN
+    """Faz MajorLogin com um token e salva JWT + Account ID extraído do JWT"""
+    global CACHED_JWT, CACHED_ACCOUNT_ID, CURRENT_TOKEN
     
     log(f"🔄 Obtendo JWT para token: {token[:30]}...")
     
@@ -175,18 +195,36 @@ def get_cached_jwt_from_token(token):
             
             if login_res and login_res.account_jwt:
                 jwt = login_res.account_jwt
+                
                 log(f"✅ JWT obtido com sucesso!")
                 log(f"📏 Tamanho do JWT: {len(jwt)} caracteres")
                 
+                # Extrai account_id do JWT
+                decoded = decode_jwt(jwt)
+                if not decoded:
+                    log("❌ Falha ao decodificar JWT")
+                    return None
+                
+                account_id = decoded.get("account_id")
+                if not account_id:
+                    log("❌ JWT não contém account_id")
+                    return None
+                
+                log(f"🆔 Account ID extraído do JWT: {account_id}")
+                
                 # Atualiza variáveis globais
                 CACHED_JWT = jwt
+                CACHED_ACCOUNT_ID = account_id
                 CURRENT_TOKEN = token
                 
                 # Salva token no arquivo
                 with open(TOKEN_FILE, 'w') as f:
                     f.write(token)
                 
-                return jwt
+                return {
+                    "jwt": jwt,
+                    "account_id": account_id
+                }
             else:
                 log("❌ Resposta não contém JWT")
                 return None
@@ -216,8 +254,8 @@ def load_initial_token():
     CURRENT_TOKEN = token
     log(f"✅ Token carregado: {token[:30]}...")
     
-    jwt = get_cached_jwt_from_token(token)
-    return jwt is not None
+    result = get_cached_jwt_from_token(token)
+    return result is not None
 
 # ============ ROTA CHANGE_TOKEN ============
 @app.route('/change_token', methods=['GET'])
@@ -234,13 +272,14 @@ def change_token():
     log("="*50)
     log("🔄 ALTERANDO TOKEN...")
     
-    jwt = get_cached_jwt_from_token(access_token)
+    result = get_cached_jwt_from_token(access_token)
     
-    if jwt:
+    if result:
         return jsonify({
             "success": True,
             "message": "Token alterado com sucesso!",
-            "jwt_size": len(jwt),
+            "jwt_size": len(result["jwt"]),
+            "account_id": result["account_id"],
             "token": access_token[:30] + "..."
         })
     else:
@@ -252,10 +291,10 @@ def change_token():
 # ============ ROTA MAJORLOGIN ============
 @app.route('/MajorLogin', methods=['POST'])
 def major_login():
-    global CACHED_JWT
+    global CACHED_JWT, CACHED_ACCOUNT_ID
     
-    if not CACHED_JWT:
-        log("❌ JWT não carregado!")
+    if not CACHED_JWT or not CACHED_ACCOUNT_ID:
+        log("❌ JWT ou Account ID não carregados!")
         return Response("Proxy not initialized", status=500)
     
     try:
@@ -293,11 +332,16 @@ def major_login():
             login_res = parse_major_login_response(response.content)
             
             if login_res:
-                # Substitui o JWT
+                # Substitui o JWT e Account ID
                 old_jwt = login_res.account_jwt
-                login_res.account_jwt = CACHED_JWT
+                old_account_id = login_res.account_id
                 
-                log(f"🔄 JWT substituído")
+                login_res.account_jwt = CACHED_JWT
+                login_res.account_id = CACHED_ACCOUNT_ID
+                
+                log(f"🔄 Substituídos:")
+                log(f"   JWT: {old_jwt[:30] if old_jwt else 'None'}... -> {CACHED_JWT[:30]}...")
+                log(f"   Account ID: {old_account_id} -> {CACHED_ACCOUNT_ID}")
                 
                 # Serializa e retorna protobuf puro
                 new_content = login_res.SerializeToString()
@@ -320,7 +364,7 @@ def major_login():
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'])
 def proxy(path):
     # Se for MajorLogin, já foi tratado pela rota específica
-    if path.lower() == 'majorlogin' or path.lower() == 'change_token':
+    if path.lower() in ['majorlogin', 'change_token', 'status']:
         return Response("Not Found", status=404)
     
     try:
@@ -381,6 +425,7 @@ def status():
         "status": "online",
         "jwt_loaded": CACHED_JWT is not None,
         "jwt_size": len(CACHED_JWT) if CACHED_JWT else 0,
+        "account_id": CACHED_ACCOUNT_ID,
         "current_token": CURRENT_TOKEN[:30] + "..." if CURRENT_TOKEN else None,
         "client_version": CLIENT_VERSION,
         "freefire_api": FREEFIRE_API
@@ -397,7 +442,7 @@ if __name__ == '__main__':
         print(f"📡 Rodando em http://0.0.0.0:{PORT}")
         print(f"🔀 Rotas:")
         print(f"   /change_token?access_token=TOKEN -> Troca o token")
-        print(f"   /MajorLogin -> Substitui JWT")
+        print(f"   /MajorLogin -> Substitui JWT e Account ID")
         print(f"   /* -> Encaminha para {FREEFIRE_API}")
         print(f"   /status -> Status do proxy")
         print("="*60 + "\n")
