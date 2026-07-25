@@ -18,7 +18,7 @@ app = Flask(__name__)
 
 # ============ CONFIGURACOES ============
 TOKEN_FILE = "token.txt"
-PORT = 5000
+PORT = 5001
 CLIENT_VERSION = "OB54"
 FREEFIRE_API = "https://client.us.freefiremobile.com"
 
@@ -27,8 +27,8 @@ AES_KEY = b'Yg&tc%DEuh6%Zc^8'
 AES_IV = b'6oyZDr22E3ychjM%'
 
 # ============ VARIAVEIS GLOBAIS ============
-CACHED_JWT = None
-CACHED_ACCOUNT_ID = None
+CACHED_RESPONSE = None  # Resposta completa do MajorLogin (protobuf)
+CACHED_DATA = {}  # Dados extraídos para debug
 CURRENT_TOKEN = None
 
 # ============ FUNCOES ============
@@ -40,7 +40,7 @@ def encrypt_packet(data_bytes):
     return cipher.encrypt(pad(data_bytes, AES.block_size))
 
 def decode_jwt(jwt):
-    """Decodifica JWT sem verificar assinatura e extrai account_id"""
+    """Decodifica JWT sem verificar assinatura"""
     try:
         parts = jwt.split('.')
         if len(parts) != 3:
@@ -50,8 +50,7 @@ def decode_jwt(jwt):
         padding = '=' * (4 - len(payload) % 4)
         payload += padding
         decoded = base64.urlsafe_b64decode(payload)
-        data = json.loads(decoded)
-        return data
+        return json.loads(decoded)
     except Exception as e:
         log(f"❌ Erro ao decodificar JWT: {e}")
         return None
@@ -149,11 +148,9 @@ def parse_major_login_response(data):
         log(f"❌ Erro ao parsear resposta: {e}")
         return None
 
-def get_cached_jwt_from_token(token):
-    """Faz MajorLogin com um token e salva JWT + Account ID extraído do JWT"""
-    global CACHED_JWT, CACHED_ACCOUNT_ID, CURRENT_TOKEN
-    
-    log(f"🔄 Obtendo JWT para token: {token[:30]}...")
+def fetch_major_login_response(token):
+    """Faz MajorLogin e retorna a resposta completa"""
+    log(f"🔄 Obtendo resposta MajorLogin para token: {token[:30]}...")
     
     # Pega open_id e platform
     info = get_token_info(token)
@@ -191,43 +188,30 @@ def get_cached_jwt_from_token(token):
         )
         
         if response.status_code == 200:
-            login_res = parse_major_login_response(response.content)
+            log(f"✅ Resposta obtida: {len(response.content)} bytes")
             
-            if login_res and login_res.account_jwt:
-                jwt = login_res.account_jwt
-                
-                log(f"✅ JWT obtido com sucesso!")
-                log(f"📏 Tamanho do JWT: {len(jwt)} caracteres")
+            # Parseia para extrair dados de debug
+            login_res = parse_major_login_response(response.content)
+            if login_res:
+                CACHED_DATA["jwt"] = login_res.account_jwt[:30] + "..." if login_res.account_jwt else None
+                CACHED_DATA["account_id"] = login_res.account_id
+                CACHED_DATA["uid"] = login_res.uid
+                CACHED_DATA["region"] = login_res.region
                 
                 # Extrai account_id do JWT
-                decoded = decode_jwt(jwt)
-                if not decoded:
-                    log("❌ Falha ao decodificar JWT")
-                    return None
+                if login_res.account_jwt:
+                    decoded = decode_jwt(login_res.account_jwt)
+                    if decoded:
+                        CACHED_DATA["jwt_account_id"] = decoded.get("account_id")
                 
-                account_id = decoded.get("account_id")
-                if not account_id:
-                    log("❌ JWT não contém account_id")
-                    return None
-                
-                log(f"🆔 Account ID extraído do JWT: {account_id}")
-                
-                # Atualiza variáveis globais
-                CACHED_JWT = jwt
-                CACHED_ACCOUNT_ID = account_id
-                CURRENT_TOKEN = token
-                
-                # Salva token no arquivo
-                with open(TOKEN_FILE, 'w') as f:
-                    f.write(token)
-                
-                return {
-                    "jwt": jwt,
-                    "account_id": account_id
-                }
-            else:
-                log("❌ Resposta não contém JWT")
-                return None
+                log(f"   Account ID: {login_res.account_id}")
+                log(f"   UID: {login_res.uid}")
+                log(f"   Region: {login_res.region}")
+                log(f"   Country: {login_res.country_code}")
+                log(f"   JWT: {login_res.account_jwt[:30] if login_res.account_jwt else 'None'}...")
+            
+            # Salva a resposta COMPLETA (o clone)
+            return response.content
         else:
             log(f"❌ Erro na requisição: {response.status_code}")
             log(f"Resposta: {response.content[:200]}")
@@ -238,8 +222,8 @@ def get_cached_jwt_from_token(token):
         return None
 
 def load_initial_token():
-    """Carrega token do arquivo e obtém JWT"""
-    global CURRENT_TOKEN
+    """Carrega token do arquivo e obtém a resposta"""
+    global CACHED_RESPONSE, CURRENT_TOKEN
     
     try:
         with open(TOKEN_FILE, 'r') as f:
@@ -254,13 +238,15 @@ def load_initial_token():
     CURRENT_TOKEN = token
     log(f"✅ Token carregado: {token[:30]}...")
     
-    result = get_cached_jwt_from_token(token)
-    return result is not None
+    CACHED_RESPONSE = fetch_major_login_response(token)
+    return CACHED_RESPONSE is not None
 
 # ============ ROTA CHANGE_TOKEN ============
 @app.route('/change_token', methods=['GET'])
 def change_token():
-    """Muda o token e recarrega o JWT"""
+    """Muda o token e recarrega a resposta"""
+    global CACHED_RESPONSE, CURRENT_TOKEN
+    
     access_token = request.args.get('access_token')
     
     if not access_token:
@@ -272,88 +258,48 @@ def change_token():
     log("="*50)
     log("🔄 ALTERANDO TOKEN...")
     
-    result = get_cached_jwt_from_token(access_token)
+    response_data = fetch_major_login_response(access_token)
     
-    if result:
+    if response_data:
+        CACHED_RESPONSE = response_data
+        CURRENT_TOKEN = access_token
+        
+        # Salva token no arquivo
+        with open(TOKEN_FILE, 'w') as f:
+            f.write(access_token)
+        
         return jsonify({
             "success": True,
             "message": "Token alterado com sucesso!",
-            "jwt_size": len(result["jwt"]),
-            "account_id": result["account_id"],
+            "response_size": len(response_data),
+            "account_id": CACHED_DATA.get("account_id"),
+            "uid": CACHED_DATA.get("uid"),
+            "region": CACHED_DATA.get("region"),
             "token": access_token[:30] + "..."
         })
     else:
         return jsonify({
             "success": False,
-            "error": "Falha ao obter JWT para o novo token"
+            "error": "Falha ao obter resposta para o novo token"
         }), 500
 
 # ============ ROTA MAJORLOGIN ============
 @app.route('/MajorLogin', methods=['POST'])
 def major_login():
-    global CACHED_JWT, CACHED_ACCOUNT_ID
+    global CACHED_RESPONSE
     
-    if not CACHED_JWT or not CACHED_ACCOUNT_ID:
-        log("❌ JWT ou Account ID não carregados!")
+    if not CACHED_RESPONSE:
+        log("❌ Resposta não carregada!")
         return Response("Proxy not initialized", status=500)
     
     try:
-        # Monta headers manualmente
-        headers = {
-            "User-Agent": request.headers.get("User-Agent", "Dalvik/2.1.0 (Linux; U; Android 11; SM-S908E Build/TP1A.220624.014)"),
-            "Connection": "Keep-Alive",
-            "Accept-Encoding": "gzip",
-            "Content-Type": request.headers.get("Content-Type", "application/octet-stream"),
-            "Expect": "100-continue",
-            "X-GA": request.headers.get("X-GA", "v1 1"),
-            "X-Unity-Version": request.headers.get("X-Unity-Version", "2018.4.11f1"),
-            "ReleaseVersion": request.headers.get("ReleaseVersion", CLIENT_VERSION)
-        }
+        log(f"📥 MajorLogin recebido - retornando resposta clonada")
+        log(f"📏 Tamanho da resposta: {len(CACHED_RESPONSE)} bytes")
         
-        # Remove headers vazios
-        headers = {k: v for k, v in headers.items() if v}
-        
-        body = request.get_data()
-        
-        log(f"📥 MajorLogin recebido: {len(body)} bytes")
-        
-        # Reencaminha para Garena
-        with httpx.Client(timeout=30, verify=False) as client:
-            response = client.post(
-                "https://loginbp.ggpolarbear.com/MajorLogin",
-                headers=headers,
-                content=body
-            )
-        
-        log(f"📤 Resposta da Garena: {response.status_code} - {len(response.content)} bytes")
-        
-        if response.status_code == 200:
-            # Resposta é protobuf puro
-            login_res = parse_major_login_response(response.content)
-            
-            if login_res:
-                # Substitui o JWT e Account ID
-                old_jwt = login_res.account_jwt
-                old_account_id = login_res.account_id
-                
-                login_res.account_jwt = CACHED_JWT
-                login_res.account_id = CACHED_ACCOUNT_ID
-                
-                log(f"🔄 Substituídos:")
-                log(f"   JWT: {old_jwt[:30] if old_jwt else 'None'}... -> {CACHED_JWT[:30]}...")
-                log(f"   Account ID: {old_account_id} -> {CACHED_ACCOUNT_ID}")
-                
-                # Serializa e retorna protobuf puro
-                new_content = login_res.SerializeToString()
-                
-                resp = Response(new_content, status=200)
-                resp.headers["Content-Type"] = "application/octet-stream"
-                return resp
-            else:
-                log("❌ Falha ao parsear resposta")
-                return Response(response.content, status=response.status_code)
-        else:
-            return Response(response.content, status=response.status_code)
+        # Retorna a resposta clonada
+        resp = Response(CACHED_RESPONSE, status=200)
+        resp.headers["Content-Type"] = "application/octet-stream"
+        return resp
             
     except Exception as e:
         log(f"❌ Erro: {e}")
@@ -423,9 +369,12 @@ def proxy(path):
 def status():
     return jsonify({
         "status": "online",
-        "jwt_loaded": CACHED_JWT is not None,
-        "jwt_size": len(CACHED_JWT) if CACHED_JWT else 0,
-        "account_id": CACHED_ACCOUNT_ID,
+        "response_loaded": CACHED_RESPONSE is not None,
+        "response_size": len(CACHED_RESPONSE) if CACHED_RESPONSE else 0,
+        "account_id": CACHED_DATA.get("account_id"),
+        "jwt_account_id": CACHED_DATA.get("jwt_account_id"),
+        "uid": CACHED_DATA.get("uid"),
+        "region": CACHED_DATA.get("region"),
         "current_token": CURRENT_TOKEN[:30] + "..." if CURRENT_TOKEN else None,
         "client_version": CLIENT_VERSION,
         "freefire_api": FREEFIRE_API
@@ -434,15 +383,15 @@ def status():
 # ============ INICIALIZACAO ============
 if __name__ == '__main__':
     print("\n" + "="*60)
-    print("PROXY - MAJORLOGIN JWT REPLACER")
+    print("PROXY - MAJORLOGIN CLONE RESPONDER")
     print("="*60)
     
     if load_initial_token():
         print("\n✅ Proxy pronto!")
         print(f"📡 Rodando em http://0.0.0.0:{PORT}")
         print(f"🔀 Rotas:")
-        print(f"   /change_token?access_token=TOKEN -> Troca o token")
-        print(f"   /MajorLogin -> Substitui JWT e Account ID")
+        print(f"   /change_token?access_token=TOKEN -> Troca o token e recarrega o clone")
+        print(f"   /MajorLogin -> Retorna o clone salvo (NÃO faz requisição)")
         print(f"   /* -> Encaminha para {FREEFIRE_API}")
         print(f"   /status -> Status do proxy")
         print("="*60 + "\n")
